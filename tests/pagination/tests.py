@@ -8,16 +8,23 @@ from datetime import datetime
 from django.core.paginator import (
     AsyncPaginator,
     BasePaginator,
+    CountlessPaginator,
     EmptyPage,
     InvalidPage,
     PageNotAnInteger,
     Paginator,
     UnorderedObjectListWarning,
 )
+from django.db import connection
 from django.test import SimpleTestCase, TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils.deprecation import RemovedInDjango70Warning
 
-from .custom import AsyncValidAdjacentNumsPaginator, ValidAdjacentNumsPaginator
+from .custom import (
+    AsyncValidAdjacentNumsPaginator,
+    ValidAdjacentNumsCountlessPaginator,
+    ValidAdjacentNumsPaginator,
+)
 from .models import Article
 
 
@@ -767,6 +774,135 @@ class PaginationTests(SimpleTestCase):
                 self.assertEqual([p async for p in page_range], expected)
 
 
+class CountlessPaginationTests(SimpleTestCase):
+    """
+    Tests for the CountlessPaginator and CountlessPage classes.
+    """
+
+    def test_pages_no_orphans(self):
+        ten = list(range(1, 11))
+        paginator = CountlessPaginator(ten, 4)
+        page1 = paginator.page(1)
+        self.assertEqual(list(page1), [1, 2, 3, 4])
+        self.assertTrue(page1.has_next())
+        self.assertFalse(page1.has_previous())
+        page2 = paginator.page(2)
+        self.assertEqual(list(page2), [5, 6, 7, 8])
+        self.assertTrue(page2.has_next())
+        self.assertTrue(page2.has_previous())
+        page3 = paginator.page(3)
+        self.assertEqual(list(page3), [9, 10])
+        self.assertFalse(page3.has_next())
+        self.assertTrue(page3.has_previous())
+        with self.assertRaises(EmptyPage):
+            paginator.page(4)
+
+    def test_pages_with_orphans(self):
+        # With 23 items, per_page=10, and orphans=3, the trailing 3 items are
+        # merged into the second (and last) page, matching Paginator.
+        twenty_three = list(range(1, 24))
+        paginator = CountlessPaginator(twenty_three, 10, orphans=3)
+        page1 = paginator.page(1)
+        self.assertEqual(len(page1), 10)
+        self.assertTrue(page1.has_next())
+        page2 = paginator.page(2)
+        self.assertEqual(len(page2), 13)
+        self.assertFalse(page2.has_next())
+        with self.assertRaises(EmptyPage):
+            paginator.page(3)
+
+    def test_empty_object_list(self):
+        paginator = CountlessPaginator([], 5)
+        page = paginator.page(1)
+        self.assertEqual(list(page), [])
+        self.assertFalse(page.has_next())
+        self.assertFalse(page.has_previous())
+
+    def test_empty_object_list_and_allow_empty_first_page_false(self):
+        paginator = CountlessPaginator([], 5, allow_empty_first_page=False)
+        with self.assertRaises(EmptyPage):
+            paginator.page(1)
+
+    def test_invalid_page_number(self):
+        paginator = CountlessPaginator([1, 2, 3], 2)
+        with self.assertRaises(PageNotAnInteger):
+            paginator.validate_number(None)
+        with self.assertRaises(PageNotAnInteger):
+            paginator.validate_number("x")
+        with self.assertRaises(EmptyPage):
+            paginator.validate_number(0)
+        with self.assertRaises(EmptyPage):
+            paginator.validate_number(-1)
+
+    def test_get_page(self):
+        paginator = CountlessPaginator([1, 2, 3], 2)
+        self.assertEqual(paginator.get_page(1).number, 1)
+        # Non-integer page falls back to the first page.
+        self.assertEqual(paginator.get_page(None).number, 1)
+        # An out-of-range page also falls back to the first page, since the
+        # last page number isn't known without a COUNT query.
+        self.assertEqual(paginator.get_page(50).number, 1)
+
+    def test_get_page_empty_object_list_and_allow_empty_first_page_false(self):
+        paginator = CountlessPaginator([], 2, allow_empty_first_page=False)
+        with self.assertRaises(EmptyPage):
+            paginator.get_page(1)
+
+    def test_paginator_iteration(self):
+        paginator = CountlessPaginator([1, 2, 3], 2)
+        self.assertEqual([list(page) for page in paginator], [[1, 2], [3]])
+        self.assertEqual([str(page) for page in paginator], ["<Page 1>", "<Page 2>"])
+
+    def test_page_sequence(self):
+        eleven = "abcdefghijk"
+        page2 = CountlessPaginator(eleven, per_page=5, orphans=1).page(2)
+        self.assertEqual(len(page2), 6)
+        self.assertIn("k", page2)
+        self.assertNotIn("a", page2)
+        self.assertEqual("".join(page2), "fghijk")
+        self.assertEqual("".join(reversed(page2)), "kjihgf")
+
+    def test_page_indexes(self):
+        ten = list(range(1, 11))
+        paginator = CountlessPaginator(ten, 4)
+        page1 = paginator.page(1)
+        self.assertEqual(page1.start_index(), 1)
+        self.assertEqual(page1.end_index(), 4)
+        page3 = paginator.page(3)
+        self.assertEqual(page3.start_index(), 9)
+        self.assertEqual(page3.end_index(), 10)
+
+    def test_page_indexes_empty(self):
+        page = CountlessPaginator([], 4).page(1)
+        self.assertEqual(page.start_index(), 0)
+        self.assertEqual(page.end_index(), 0)
+
+    def test_next_previous_page_number(self):
+        paginator = CountlessPaginator([1, 2, 3], 2)
+        page1 = paginator.page(1)
+        self.assertEqual(page1.next_page_number(), 2)
+        with self.assertRaises(InvalidPage):
+            page1.previous_page_number()
+        page2 = paginator.page(2)
+        self.assertEqual(page2.previous_page_number(), 1)
+        with self.assertRaises(InvalidPage):
+            page2.next_page_number()
+
+    def test_get_page_hook(self):
+        """
+        A CountlessPaginator subclass can use the ``_get_page`` hook to
+        return an alternative to the standard CountlessPage class.
+        """
+        eleven = "abcdefghijk"
+        paginator = ValidAdjacentNumsCountlessPaginator(eleven, per_page=6)
+        page1 = paginator.page(1)
+        page2 = paginator.page(2)
+        self.assertIsNone(page1.previous_page_number())
+        self.assertEqual(page1.next_page_number(), 2)
+        self.assertEqual(page2.previous_page_number(), 1)
+        self.assertIsNone(page2.next_page_number())
+
+
 class ModelPaginationTests(TestCase):
     """
     Test pagination with Django model instances
@@ -979,6 +1115,23 @@ class ModelPaginationTests(TestCase):
         p = await paginator.apage(1)
         object_list = [obj async for obj in p]
         self.assertEqual(len(object_list), 5)
+
+    def test_countless_paginator_avoids_count_query(self):
+        """
+        CountlessPaginator determines has_next() without running a COUNT
+        query against the underlying QuerySet.
+        """
+        paginator = CountlessPaginator(Article.objects.order_by("id"), 5)
+        with CaptureQueriesContext(connection) as ctx:
+            page1 = paginator.page(1)
+            self.assertSequenceEqual(page1, self.articles[:5])
+            self.assertTrue(page1.has_next())
+            page2 = paginator.page(2)
+            self.assertSequenceEqual(page2, self.articles[5:])
+            self.assertFalse(page2.has_next())
+        self.assertFalse(
+            any("COUNT" in query["sql"].upper() for query in ctx.captured_queries)
+        )
 
     async def test_aget_object_list(self):
         paginator = AsyncPaginator(Article.objects.order_by("id"), 5)

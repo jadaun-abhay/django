@@ -197,6 +197,16 @@ Models
 
 * ...
 
+Pagination
+~~~~~~~~~~
+
+* The new :class:`~django.core.paginator.CountlessPaginator` and
+  :class:`~django.core.paginator.CountlessPage` classes provide pagination
+  without running a ``COUNT`` query, by fetching one extra item per page to
+  determine whether a next page exists. This avoids the cost of ``COUNT`` on
+  large tables for UIs, such as infinite scroll or "Previous/Next"-only
+  navigation, that don't need to display a total number of pages.
+
 Requests and Responses
 ~~~~~~~~~~~~~~~~~~~~~~
 

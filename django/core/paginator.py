@@ -205,6 +205,84 @@ class Paginator(BasePaginator):
         )
 
 
+class CountlessPaginator(BasePaginator):
+    """
+    A paginator that avoids running a COUNT query against object_list.
+
+    Rather than computing the total number of objects and pages upfront,
+    existence of a next page is determined by fetching one extra item (and,
+    if orphans are in use, up to `orphans` further items) per page. This
+    makes `count`, `num_pages`, `page_range`, and `get_elided_page_range()`
+    unavailable, since the total is never known.
+    """
+
+    def __iter__(self):
+        number = 1
+        while True:
+            try:
+                page = self.page(number)
+            except EmptyPage:
+                return
+            yield page
+            if not page.has_next():
+                return
+            number += 1
+
+    def validate_number(self, number):
+        """Validate the given 1-based page number."""
+        try:
+            if isinstance(number, float) and not number.is_integer():
+                raise ValueError
+            number = int(number)
+        except (TypeError, ValueError):
+            raise PageNotAnInteger(self.error_messages["invalid_page"])
+        if number < 1:
+            raise EmptyPage(self.error_messages["min_page"])
+        return number
+
+    def get_page(self, number):
+        """
+        Return a valid page, even if the page argument isn't a number or
+        isn't in range.
+
+        Unlike Paginator.get_page(), an out-of-range page number falls back
+        to the first page rather than the last page, since the last page
+        number isn't known without a COUNT query.
+        """
+        try:
+            number = self.validate_number(number)
+        except (PageNotAnInteger, EmptyPage):
+            number = 1
+        try:
+            return self.page(number)
+        except EmptyPage:
+            if number == 1:
+                raise
+            return self.page(1)
+
+    def page(self, number):
+        """Return a Page object for the given 1-based page number."""
+        number = self.validate_number(number)
+        bottom = (number - 1) * self.per_page
+        # Fetch one extra item, beyond any orphans, to determine whether a
+        # next page exists without running a COUNT query.
+        top = bottom + self.per_page + self.orphans + 1
+        items = list(self.object_list[bottom:top])
+        has_next = len(items) > self.per_page + self.orphans
+        if has_next:
+            items = items[: self.per_page]
+        elif number > 1 and len(items) <= self.orphans:
+            # These items, if any, belong to the previous page's orphans,
+            # so this page doesn't actually exist.
+            raise EmptyPage(self.error_messages["no_results"])
+        if not items and not (number == 1 and self.allow_empty_first_page):
+            raise EmptyPage(self.error_messages["no_results"])
+        return self._get_page(items, number, self, has_next)
+
+    def _get_page(self, *args, **kwargs):
+        return CountlessPage(*args, **kwargs)
+
+
 class AsyncPaginator(BasePaginator):
     def __init__(
         self,
@@ -357,6 +435,68 @@ class Page(collections.abc.Sequence):
         if self.number == self.paginator.num_pages:
             return self.paginator.count
         return self.number * self.paginator.per_page
+
+
+class CountlessPage(collections.abc.Sequence):
+    def __init__(self, object_list, number, paginator, has_next):
+        self.object_list = object_list
+        self.number = number
+        self.paginator = paginator
+        self._has_next = has_next
+
+    def __repr__(self):
+        return "<Page %s>" % self.number
+
+    def __len__(self):
+        return len(self.object_list)
+
+    def __getitem__(self, index):
+        if not isinstance(index, (int, slice)):
+            raise TypeError(
+                "Page indices must be integers or slices, not %s."
+                % type(index).__name__
+            )
+        # The object_list is converted to a list so that if it was a QuerySet
+        # it won't be a database hit per __getitem__.
+        if not isinstance(self.object_list, list):
+            self.object_list = list(self.object_list)
+        return self.object_list[index]
+
+    def has_next(self):
+        return self._has_next
+
+    def has_previous(self):
+        return self.number > 1
+
+    def has_other_pages(self):
+        return self.has_previous() or self.has_next()
+
+    def next_page_number(self):
+        if not self.has_next():
+            raise EmptyPage(self.paginator.error_messages["no_results"])
+        return self.paginator.validate_number(self.number + 1)
+
+    def previous_page_number(self):
+        return self.paginator.validate_number(self.number - 1)
+
+    def start_index(self):
+        """
+        Return the 1-based index of the first object on this page,
+        relative to total objects in the paginator.
+        """
+        # Special case, return zero if no items.
+        if not self.object_list:
+            return 0
+        return (self.paginator.per_page * (self.number - 1)) + 1
+
+    def end_index(self):
+        """
+        Return the 1-based index of the last object on this page,
+        relative to total objects in the paginator.
+        """
+        if not self.object_list:
+            return 0
+        return self.start_index() + len(self.object_list) - 1
 
 
 class AsyncPage:
