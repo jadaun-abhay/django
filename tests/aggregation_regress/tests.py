@@ -997,21 +997,27 @@ class AggregationTests(TestCase):
     def test_field_name_conflict(self):
         # Regression for #11256 - providing an aggregate name
         # that conflicts with a field name on the model raises ValueError
-        msg = "The annotation 'age' conflicts with a field on the model."
-        with self.assertRaisesMessage(ValueError, msg):
-            Author.objects.annotate(age=Avg("friends__age"))
+        qs = Author.objects.annotate(age=Avg("friends__age"))
+        expected = {
+            author.pk: author.friends__age__avg
+            for author in Author.objects.annotate(Avg("friends__age"))
+        }
+        for author in qs:
+            self.assertEqual(author.age, expected[author.pk])
 
     def test_m2m_name_conflict(self):
         # Regression for #11256 - providing an aggregate name
         # that conflicts with an m2m name on the model raises ValueError
-        msg = "The annotation 'friends' conflicts with a field on the model."
+        msg = "The annotation 'friends' is not a concrete field and "
+        "conflicts with a field on the model."
         with self.assertRaisesMessage(ValueError, msg):
             Author.objects.annotate(friends=Count("friends"))
 
     def test_fk_attname_conflict(self):
-        msg = "The annotation 'contact_id' conflicts with a field on the model."
-        with self.assertRaisesMessage(ValueError, msg):
-            Book.objects.annotate(contact_id=F("publisher_id"))
+        qs = Book.objects.annotate(contact_id=F("publisher_id"))
+        expected = {book.pk: book.publisher.pk for book in Book.objects.all()}
+        for book in qs:
+            self.assertEqual(book.contact.pk, expected[book.pk])
 
     def test_values_queryset_non_conflict(self):
         # If you're using a values query set, some potential conflicts are
@@ -1051,7 +1057,8 @@ class AggregationTests(TestCase):
         # Regression for #11256 - providing an aggregate name
         # that conflicts with a reverse-related name on the model raises
         # ValueError
-        msg = "The annotation 'book_contact_set' conflicts with a field on the model."
+        msg = "The annotation 'book_contact_set' is not a concrete field "
+        "and conflicts with a field on the model."
         with self.assertRaisesMessage(ValueError, msg):
             Author.objects.annotate(book_contact_set=Avg("friends__age"))
 
